@@ -1,4 +1,4 @@
-# compress_media.py
+# adb-compress.py
 
 Batch-compress images and videos on your PC, with optional Android phone support via ADB. Heavy encoding runs on the PC — not on your phone.
 

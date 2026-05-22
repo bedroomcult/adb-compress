@@ -251,28 +251,82 @@ def adb_check():
 def adb_list_files(remote_dir, recursive=False):
     """
     Return list of (remote_path, size_bytes, mtime_epoch) for media files.
-    Uses `adb shell find` so we get mtime without a separate stat call.
+
+    Primary strategy: `find -printf` (GNU find) — one round-trip.
+    Fallback: plain `find` to list paths, then `stat` each file — works on
+    devices that ship busybox find without -printf support.
     """
     depth = "" if recursive else "-maxdepth 1"
-    extensions = r"\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' " \
-                 r"-o -iname '*.webp' -o -iname '*.mp4' -o -iname '*.mkv' " \
-                 r"-o -iname '*.mov' -o -iname '*.avi' \)"
-    # printf gives us: path\0size\0mtime
-    cmd = f"find {remote_dir} {depth} -type f {extensions} " \
-          r"-printf '%p\0%s\0%T@\0'"
-    result = subprocess.run(
-        ["adb", "shell", cmd],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        errors="replace",
+    extensions = (
+        r"\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' "
+        r"-o -iname '*.webp' -o -iname '*.mp4' -o -iname '*.mkv' "
+        r"-o -iname '*.mov' -o -iname '*.avi' \)"
     )
-    if result.returncode != 0:
-        print(f"❌ adb shell find failed: {result.stderr.strip()}")
+
+    # ── Strategy 1: GNU find -printf (fast, single round-trip) ──────────────
+    printf_cmd = (
+        f"find {remote_dir} {depth} -type f {extensions} "
+        r"-printf '%p\0%s\0%T@\0'"
+    )
+    r = subprocess.run(
+        ["adb", "shell", printf_cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace",
+    )
+
+    # Detect busybox "find: -printf: unknown option" style failures
+    printf_unsupported = (
+        r.returncode != 0
+        or "unknown option" in r.stderr.lower()
+        or "invalid option" in r.stderr.lower()
+        or (not r.stdout.strip() and "printf" in r.stderr.lower())
+    )
+
+    if not printf_unsupported:
+        entries = []
+        parts = r.stdout.split("\0")
+        it = iter(parts)
+        for path in it:
+            path = path.strip()
+            if not path:
+                continue
+            try:
+                size = int(next(it).strip())
+                mtime = float(next(it).strip())
+                entries.append((path, size, mtime))
+            except (StopIteration, ValueError):
+                break
+        if entries or not r.stdout.strip():
+            # Got a clean (possibly empty) result — trust it.
+            return entries
+
+    # ── Strategy 2: plain find + per-file stat (busybox fallback) ───────────
+    list_cmd = f"find {remote_dir} {depth} -type f {extensions}"
+    r2 = subprocess.run(
+        ["adb", "shell", list_cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace",
+    )
+    if r2.returncode != 0:
+        print(f"\u274c adb shell find failed: {r2.stderr.strip()}")
         return []
 
+    paths = [p.strip() for p in r2.stdout.splitlines() if p.strip()]
+    if not paths:
+        return []
+
+    # Batch stat calls: build a one-liner that prints path\0size\0mtime\0 for
+    # each file using POSIX `stat` (available on all Android versions).
+    stat_script = "; ".join(
+        f'stat -c "%n\\0%s\\0%Y\\0" "{p}"' for p in paths
+    )
+    r3 = subprocess.run(
+        ["adb", "shell", stat_script],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace",
+    )
     entries = []
-    parts = result.stdout.split("\0")
+    parts = r3.stdout.split("\0")
     it = iter(parts)
     for path in it:
         path = path.strip()
@@ -282,9 +336,10 @@ def adb_list_files(remote_dir, recursive=False):
             size = int(next(it).strip())
             mtime = float(next(it).strip())
             entries.append((path, size, mtime))
-        except StopIteration:
+        except (StopIteration, ValueError):
             break
     return entries
+
 
 def adb_pull(remote_path, local_path):
     run(["adb", "pull", remote_path, str(local_path)],
@@ -389,39 +444,42 @@ def adb_discover_paths():
 EXTENSIONS_IMG = {'.jpg', '.jpeg', '.png', '.webp'}
 EXTENSIONS_VID = {'.mp4', '.mkv', '.mov', '.avi'}
 
-def compress_image(input_path, output_path, target_width):
+def compress_image(input_path, output_path, max_width):
+    """
+    Compress an image.
+    - Only resizes if image is wider than max_width (preserves smaller images).
+    - Skips re-encoding if it would not reduce file size.
+    Returns (True, None) on success, (False, None) on error.
+    """
     from PIL import Image
+    import io as _io
+    input_path = Path(input_path)
+    output_path = Path(output_path)
     try:
+        original_size = input_path.stat().st_size
         with Image.open(input_path) as img:
-            if img.size[0] <= target_width:
-                img.save(output_path, optimize=True, quality=85)
-            else:
-                w_pct = target_width / float(img.size[0])
+            needs_resize = img.size[0] > max_width
+            if needs_resize:
+                w_pct = max_width / float(img.size[0])
                 h_size = int(img.size[1] * w_pct)
-                img = img.resize((target_width, h_size), Image.Resampling.LANCZOS)
-                img.save(output_path, optimize=True, quality=85)
+                img = img.resize((max_width, h_size), Image.Resampling.LANCZOS)
+
+            # Write to a buffer first to compare sizes — avoids the case where
+            # re-encoding a well-optimised JPEG at quality=85 grows the file.
+            buf = _io.BytesIO()
+            img.save(buf, format=img.format or "JPEG", optimize=True, quality=85)
+            compressed_bytes = buf.getvalue()
+
+            # Always compare: even resized images can be larger after re-encoding.
+            if len(compressed_bytes) >= original_size:
+                # Re-encoding would make it bigger — copy the original unchanged.
+                shutil.copy2(input_path, output_path)
+            else:
+                output_path.write_bytes(compressed_bytes)
         return True
     except Exception as e:
-        print(f"\n❌ Image Error {Path(input_path).name}: {e}")
+        print(f"\n❌ Image Error {input_path.name}: {e}")
         return False
-
-def _probe_duration(input_path):
-    """Return duration in seconds via ffprobe, or None if unavailable."""
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(input_path),
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            encoding="utf-8", errors="replace",
-        )
-        return float(r.stdout.strip())
-    except Exception:
-        return None
 
 def _parse_time(time_str):
     """Convert HH:MM:SS.ss string to total seconds, or None on failure."""
@@ -437,12 +495,73 @@ def _bar(pct, width=20):
     bar = "█" * filled + "░" * (width - filled)
     return f"[{bar}] {pct:3.0f}%"
 
-def compress_video(input_path, output_path, target_width, crf, prefix=""):
+def _probe_video(input_path):
     """
-    Compress a video, showing a live single-line progress bar:
-      [2/5] 🔧 holiday.mp4  [████████░░░░░░░░░░░░]  42%  |  fps=87  speed=3.6x
+    Return (duration_seconds, width_px, bitrate_mbps) via ffprobe.
+    Returns (None, None, None) if ffprobe is unavailable or fails.
+    """
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "format=duration,bit_rate:stream=width",
+                "-of", "csv=p=0",
+                str(input_path),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            encoding="utf-8", errors="replace",
+        )
+        lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+        if not lines:
+            return None, None, None
+        # ffprobe csv output: duration,bit_rate,width
+        parts = [p.strip() for p in lines[0].split(",")]
+        duration = float(parts[0]) if parts[0] else None
+        bitrate_bps = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        bitrate_mbps = round(bitrate_bps / 1_000_000, 1) if bitrate_bps else None
+        width = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        return duration, width, bitrate_mbps
+    except Exception:
+        return None, None, None
+
+
+def _video_needs_compress(input_path, max_width, max_bitrate_mbps):
+    """
+    Return (needs_compress: bool, reason: str).
+    Probes the video and returns False + reason if it's already within limits.
+    """
+    duration, width, bitrate = _probe_video(input_path)
+    reasons = []
+
+    if max_width and width and width <= max_width:
+        reasons.append(f"{width}px ≤ {max_width}px")
+    if max_bitrate_mbps and bitrate and bitrate <= max_bitrate_mbps:
+        reasons.append(f"{bitrate}Mbps ≤ {max_bitrate_mbps}Mbps")
+
+    if not reasons:
+        return True, ""
+
+    # All limits satisfied?
+    within_width = not max_width or not width or width <= max_width
+    within_bitrate = not max_bitrate_mbps or not bitrate or bitrate <= max_bitrate_mbps
+    if within_width and within_bitrate:
+        detail = "  |  ".join(reasons)
+        return False, f"⏭  Already within limits — {detail}"
+
+    return True, ""
+
+
+def compress_video(input_path, output_path, max_width, crf, max_bitrate_mbps=None, prefix=""):
+    """
+    Compress a video.
+    - Only rescales if input is wider than max_width.
+    - Applies max_bitrate cap if specified.
+    - Returns (True, None) on success, (False, None) on error, None on cancel.
     """
     encoder, _ = get_encoder()
+
+    _, input_width, _ = _probe_video(input_path)
 
     hw_quality_flags = {
         "h264_nvenc":        ["-cq", str(crf)],
@@ -453,19 +572,32 @@ def compress_video(input_path, output_path, target_width, crf, prefix=""):
     }
     quality_flags = hw_quality_flags.get(encoder, ["-crf", str(crf), "-preset", "fast"])
 
+    # Only add scale filter if the input is wider than max_width.
+    vf_parts = []
+    if input_width is not None and input_width > max_width:
+        vf_parts.append(f"scale={max_width}:-2")
+
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
-        "-vf", f"scale={target_width}:-2",
         "-vcodec", encoder,
         *quality_flags,
+    ]
+    if vf_parts:
+        cmd += ["-vf", ",".join(vf_parts)]
+    if max_bitrate_mbps:
+        cmd += [
+            "-maxrate", f"{max_bitrate_mbps}M",
+            "-bufsize", f"{max_bitrate_mbps * 2}M",
+        ]
+    cmd += [
         "-acodec", "aac",
         "-stats",
         "-loglevel", "error",
         str(output_path),
     ]
 
-    duration = _probe_duration(input_path)   # seconds, may be None
+    duration, _, _ = _probe_video(input_path)
     term_width = shutil.get_terminal_size(fallback=(120, 24)).columns
 
     try:
@@ -543,19 +675,47 @@ _cancel = threading.Event()  # set this to request a graceful cancel
 
 def _cancel_listener():
     """
-    Background thread: wait for the user to press Q (then Enter).
-    Sets _cancel so the main loop stops after the current file finishes,
-    or kills a running ffmpeg process immediately.
-    Works on all platforms without raw/cbreak terminal mode.
+    Background thread: wait for the user to press Q (then Enter) to cancel.
+
+    Reads directly from the OS file descriptor (fd 0) instead of calling
+    input() / sys.stdin.readline(), so it never races with the main thread's
+    own input() calls (the "Proceed?" prompts, guided-setup questions, etc.).
+    Both POSIX and Windows are handled:
+      - POSIX: os.read(0, 256) blocks until data arrives on stdin.
+      - Windows: msvcrt.getwch() reads one wide char without buffering.
     """
-    while not _cancel.is_set():
-        try:
-            key = input()
-        except (EOFError, OSError):
-            break
-        if key.strip().lower() == "q":
-            _cancel.set()
-            break
+    if sys.platform == "win32":
+        import msvcrt
+        buf = []
+        while not _cancel.is_set():
+            try:
+                ch = msvcrt.getwch()
+            except Exception:
+                break
+            if ch in ("\r", "\n"):
+                line = "".join(buf).strip().lower()
+                buf.clear()
+                if line == "q":
+                    _cancel.set()
+                    break
+            else:
+                buf.append(ch)
+    else:
+        fd = sys.stdin.fileno()
+        buf = b""
+        while not _cancel.is_set():
+            try:
+                chunk = os.read(fd, 256)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip().lower() == b"q":
+                    _cancel.set()
+                    return
 
 def _start_cancel_listener():
     t = threading.Thread(target=_cancel_listener, daemon=True)
@@ -611,44 +771,119 @@ def run_local(args):
     print("  💡 Press Q + Enter at any time to cancel.")
 
     ok_count = 0
+    skip_count = 0
     for i, (fp, ext, size) in enumerate(files_to_process, 1):
         if _cancel.is_set():
             break
+
+        tag = f"[{i}/{len(files_to_process)}] 🔧 {fp.name[:35]}"
+
+        # ── Image: quick dimension check via PIL ─────────────────────────────
+        if ext in EXTENSIONS_IMG:
+            try:
+                from PIL import Image
+                with Image.open(fp) as img:
+                    img_w = img.size[0]
+            except Exception:
+                img_w = None
+
+            if args.max_width and img_w and img_w <= args.max_width:
+                print(f"{tag}  ⏭  Already {img_w}px ≤ {args.max_width}px — skipped")
+                skip_count += 1
+                continue
+
+            if args.overwrite:
+                tmp = fp.with_suffix(fp.suffix + ".tmp")
+            else:
+                tmp = Path(args.output) / fp.name
+
+            print(f"{tag}", end="\r", flush=True)
+            ok = compress_image(fp, tmp, args.max_width)
+
+            if ok is None:
+                _cleanup_file(tmp)
+                break
+
+            if ok:
+                comp_size = tmp.stat().st_size
+                saving = (1 - comp_size / size) * 100 if size else 0
+
+                # Skip if re-encoding made it bigger
+                if comp_size >= size:
+                    _cleanup_file(tmp)
+                    print(f"{tag}  ⏭  Re-encode would grow — original kept")
+                    skip_count += 1
+                    continue
+
+                size_info = (f"{get_size_format(size)} → {get_size_format(comp_size)}"
+                             f"  ({saving:.0f}% smaller)")
+
+            if ok and args.overwrite:
+                try:
+                    os.replace(tmp, fp)
+                except Exception as e:
+                    print(f"\n❌ Overwrite failed {fp.name}: {e}")
+                    _cleanup_file(tmp)
+                    ok = False
+            elif not ok and args.overwrite:
+                _cleanup_file(tmp)
+
+            if ok:
+                print(f"\n{tag}  ✅  {size_info}")
+                ok_count += 1
+            continue
+
+        # ── Video: probe before encode ───────────────────────────────────────
+        needs_ok, reason = _video_needs_compress(fp, args.max_width, args.max_bitrate)
+        if not needs_ok:
+            print(f"{tag}  {reason}")
+            skip_count += 1
+            continue
 
         if args.overwrite:
             tmp = fp.with_suffix(fp.suffix + ".tmp")
         else:
             tmp = Path(args.output) / fp.name
 
-        tag = f"[{i}/{len(files_to_process)}] 🔧 {fp.name[:35]}"
         print(f"{tag}", end="\r", flush=True)
+        ok = compress_video(fp, tmp, args.max_width, args.crf, args.max_bitrate, prefix=tag)
 
-        if ext in EXTENSIONS_IMG:
-            ok = compress_image(fp, tmp, args.res)
-        else:
-            ok = compress_video(fp, tmp, args.res, args.crf, prefix=tag)
-
-        # None = cancelled mid-encode
         if ok is None:
             _cleanup_file(tmp)
             break
 
+        if ok:
+            comp_size = tmp.stat().st_size
+            saving = (1 - comp_size / size) * 100 if size else 0
+
+            # Skip if compression made it bigger
+            if comp_size >= size:
+                _cleanup_file(tmp)
+                print(f"{tag}  ⏭  Compression grew — original kept")
+                skip_count += 1
+                continue
+
+            size_info = (f"{get_size_format(size)} → {get_size_format(comp_size)}"
+                         f"  ({saving:.0f}% smaller)")
+
         if ok and args.overwrite:
             try:
-                os.remove(fp)
-                os.rename(tmp, fp)
+                os.replace(tmp, fp)
             except Exception as e:
                 print(f"\n❌ Overwrite failed {fp.name}: {e}")
+                _cleanup_file(tmp)
+                ok = False
         elif not ok and args.overwrite:
             _cleanup_file(tmp)
 
         if ok:
+            print(f"\n{tag}  ✅  {size_info}")
             ok_count += 1
 
     if _cancel.is_set():
         print(f"\n\n🛑 Cancelled after {ok_count} file(s). Partial files removed.")
     else:
-        print(f"\n\n✅ Done! Processed {ok_count} file(s).")
+        print(f"\n\n✅ Done! Compressed {ok_count}  |  Skipped {skip_count}.")
 
 # ─────────────────────────────────────────────
 # ADB mode (pull → compress locally → push back)
@@ -691,6 +926,7 @@ def run_adb(args):
 
     ok_count = 0
     fail_count = 0
+    skip_count = 0
 
     _start_cancel_listener()
     print("  💡 Press Q + Enter at any time to cancel.")
@@ -703,9 +939,10 @@ def run_adb(args):
 
             fname = Path(remote_path).name
             label = fname[:38]
+            tag = f"[{i}/{len(files_to_process)}]"
 
             # 1. Pull
-            print(f"[{i}/{len(files_to_process)}] ⬇  Pulling  {label}...", end="\r", flush=True)
+            print(f"{tag} ⬇  Pulling  {label}...", end="\r", flush=True)
             local_orig = tmpdir / ("orig_" + fname)
             local_comp = tmpdir / ("comp_" + fname)
             try:
@@ -719,16 +956,82 @@ def run_adb(args):
                 _cleanup_file(local_orig)
                 break
 
-            # 2. Compress
+            # ── Image: quick dimension check via PIL without compress ──────────
             if ext in EXTENSIONS_IMG:
-                ok = compress_image(local_orig, local_comp, args.res)
-            else:
-                ok = compress_video(local_orig, local_comp, args.res, args.crf,
-                                    prefix=f"[{i}/{len(files_to_process)}] 🔧 {fname[:35]}")
+                try:
+                    from PIL import Image
+                    with Image.open(local_orig) as img:
+                        img_w = img.size[0]
+                except Exception:
+                    img_w = None
 
-            _cleanup_file(local_orig)   # raw pull no longer needed
+                if args.max_width and img_w and img_w <= args.max_width:
+                    _cleanup_file(local_orig)
+                    print(f"{tag} ⏭  {label}  — {img_w}px ≤ {args.max_width}px on device — skipped")
+                    skip_count += 1
+                    continue
 
-            # None = cancelled mid-encode
+                # Dimension OK or unknown — compress
+                ok = compress_image(local_orig, local_comp, args.max_width)
+                _cleanup_file(local_orig)
+
+                if ok is None:
+                    _cleanup_file(local_comp)
+                    break
+
+                if not ok:
+                    _cleanup_file(local_comp)
+                    fail_count += 1
+                    continue
+
+                comp_size = local_comp.stat().st_size
+
+                # Skip if re-encoding made it bigger
+                if comp_size >= size:
+                    _cleanup_file(local_comp)
+                    print(f"{tag} ⏭  {label}  — re-encode would grow — original kept on device")
+                    skip_count += 1
+                    continue
+
+                saving = (1 - comp_size / size) * 100 if size else 0
+                size_info = (f"{get_size_format(size)} → {get_size_format(comp_size)}"
+                             f"  ({saving:.0f}% smaller)")
+
+                # Push or save
+                if args.adb_keep_local:
+                    dest = Path(args.output) / fname
+                    local_comp.rename(dest)
+                    print(f"{tag} 💾 Saved    {label}  {size_info}")
+                else:
+                    print(f"{tag} ⬆  Pushing  {label}...", end="\r", flush=True)
+                    try:
+                        adb_push(local_comp, remote_path)
+                        print(f"{tag} ✅ Done     {label}  {size_info}")
+                    except subprocess.CalledProcessError:
+                        print(f"\n❌ Push failed: {fname}")
+                        _cleanup_file(local_comp)
+                        fail_count += 1
+                        continue
+                _cleanup_file(local_comp)
+                ok_count += 1
+                continue
+
+            # ── Video: probe after pull, skip if nothing to gain ───────────────
+            needs_ok, reason = _video_needs_compress(
+                local_orig, args.max_width, args.max_bitrate)
+
+            if not needs_ok:
+                _cleanup_file(local_orig)
+                print(f"{tag} {reason}  — skipped")
+                skip_count += 1
+                continue
+
+            # 2. Compress
+            ok = compress_video(local_orig, local_comp, args.max_width, args.crf,
+                                args.max_bitrate,
+                                prefix=f"{tag} 🔧 {fname[:35]}")
+            _cleanup_file(local_orig)
+
             if ok is None:
                 _cleanup_file(local_comp)
                 break
@@ -738,24 +1041,29 @@ def run_adb(args):
                 fail_count += 1
                 continue
 
-            orig_size = size  # use the size from adb scan (local_orig already deleted)
             comp_size = local_comp.stat().st_size
-            saving = (1 - comp_size / orig_size) * 100 if orig_size else 0
 
-            # 3a. Save locally (no push)
+            # Skip if compression made it bigger
+            if comp_size >= size:
+                _cleanup_file(local_comp)
+                print(f"{tag} ⏭  {label}  — compression grew — original kept on device")
+                skip_count += 1
+                continue
+
+            saving = (1 - comp_size / size) * 100 if size else 0
+            size_info = (f"{get_size_format(size)} → {get_size_format(comp_size)}"
+                         f"  ({saving:.0f}% smaller)")
+
+            # Push or save
             if args.adb_keep_local:
                 dest = Path(args.output) / fname
                 local_comp.rename(dest)
-                print(f"[{i}/{len(files_to_process)}] 💾 Saved    {label} "
-                      f"({saving:.0f}% smaller)")
-
-            # 3b. Push back to device
+                print(f"{tag} 💾 Saved    {label}  {size_info}")
             else:
-                print(f"[{i}/{len(files_to_process)}] ⬆  Pushing  {label}...", end="\r", flush=True)
+                print(f"{tag} ⬆  Pushing  {label}...", end="\r", flush=True)
                 try:
                     adb_push(local_comp, remote_path)
-                    print(f"[{i}/{len(files_to_process)}] ✅ Done     {label} "
-                          f"({saving:.0f}% smaller)")
+                    print(f"{tag} ✅ Done     {label}  {size_info}")
                 except subprocess.CalledProcessError:
                     print(f"\n❌ Push failed: {fname}")
                     _cleanup_file(local_comp)
@@ -768,9 +1076,9 @@ def run_adb(args):
 
     print(f"\n{'─'*50}")
     if _cancel.is_set():
-        print(f"🛑 Cancelled.  ✅ Done: {ok_count}   ❌ Failed: {fail_count}   🗑  Cache cleared.")
+        print(f"🛑 Cancelled.  ✅ Done: {ok_count}   ⏭  Skipped: {skip_count}   ❌ Failed: {fail_count}   🗑  Cache cleared.")
     else:
-        print(f"✅ Success: {ok_count}   ❌ Failed: {fail_count}")
+        print(f"✅ Done: {ok_count}   ⏭  Skipped: {skip_count}   ❌ Failed: {fail_count}")
 
 # ─────────────────────────────────────────────
 # Guided setup wizard
@@ -836,8 +1144,9 @@ def guided_setup():
         age=30,
         min_size=0.0,
         recursive=False,
-        res=1280,
+        max_width=1920,
         crf=28,
+        max_bitrate=None,
     )
 
     # ── Step 2: source path ──────────────────────────
@@ -908,12 +1217,34 @@ def guided_setup():
 
     # ── Step 6: quality ─────────────────────────────
     print()
-    print("  ── Quality (press Enter to keep defaults) ──")
-    raw_res = ask("Target width in pixels", default=1280)
-    try:
-        ns.res = int(raw_res)
-    except ValueError:
-        ns.res = 1280
+    print("  ── Quality (YouTube-recommended maximums) ──")
+    YOUTUBE_TEMPLATES = {
+        "2160p (4K UHD)":        {"max_width": 3840, "max_bitrate": 45},
+        "1440p (2K QHD)":        {"max_width": 2560, "max_bitrate": 16},
+        "1080p (Full HD)":       {"max_width": 1920, "max_bitrate": 12},
+        "720p (HD)":              {"max_width": 1280, "max_bitrate":  8},
+        "480p (SD)":              {"max_width":  854, "max_bitrate":  4},
+        "Custom (enter values)": {"max_width":    0, "max_bitrate":  0},
+    }
+    choice_labels = [(label, label) for label in YOUTUBE_TEMPLATES]
+    selected_label = ask_choice("Maximum quality preset", choice_labels, default=3)
+
+    template = YOUTUBE_TEMPLATES[selected_label]
+    if template["max_width"] == 0:  # Custom
+        raw_width = ask("Maximum width in pixels (0 = no resize)", default=1920)
+        try:
+            ns.max_width = int(raw_width)
+        except ValueError:
+            ns.max_width = 1920
+        raw_bitrate = ask("Maximum video bitrate in Mbps (0 = no limit)", default=0)
+        try:
+            val = int(raw_bitrate)
+            ns.max_bitrate = val if val > 0 else None
+        except ValueError:
+            ns.max_bitrate = None
+    else:
+        ns.max_width = template["max_width"]
+        ns.max_bitrate = template["max_bitrate"]
 
     raw_crf = ask("Video CRF (0–51, lower = better quality)", default=28)
     try:
@@ -935,7 +1266,9 @@ def guided_setup():
     print(f"  Recursive : {ns.recursive}")
     print(f"  Min age   : {ns.age} days")
     print(f"  Min size  : {ns.min_size} MB")
-    print(f"  Width     : {ns.res}px   CRF: {ns.crf}")
+    max_w = ns.max_width if ns.max_width else "no limit"
+    max_b = f"{ns.max_bitrate} Mbps" if ns.max_bitrate else "no limit"
+    print(f"  Max width : {max_w}   Max bitrate: {max_b}   CRF: {ns.crf}")
     print()
     if not ask_bool("Start?", default=True):
         sys.exit(0)
@@ -990,10 +1323,12 @@ Examples
         help="Search subdirectories recursively")
 
     # Compression quality
-    parser.add_argument("-r", "--res", type=int, default=1280,
-        help="Target width in pixels (default: 1280)")
+    parser.add_argument("-r", "--max-width", type=int, default=1920,
+        help="Maximum image/video width in pixels (smaller files untouched; default: 1920)")
     parser.add_argument("-c", "--crf", type=int, default=28,
         help="Video CRF quality (0–51, lower = better, default: 28)")
+    parser.add_argument("--max-bitrate", type=float, default=0,
+        help="Maximum video bitrate in Mbps (0 or omitted = no cap; default: 0)")
 
     # ADB options
     adb_group = parser.add_argument_group("ADB options")

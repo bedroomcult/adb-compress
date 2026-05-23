@@ -600,6 +600,7 @@ def run_local(args):
 
     print(f"\n[*] Processing utilizing concurrent process pools...")
     ok_count, skip_count, fail_count = 0, 0, 0
+    total_saved_bytes = 0
     
     with ProcessPoolExecutor() as executor:
         futures = {executor.submit(process_file_worker, tasks[i]): i + 1 for i in range(len(tasks))}
@@ -612,6 +613,7 @@ def run_local(args):
 
             if status == "success":
                 ok_count += 1
+                total_saved_bytes += (orig_sz - comp_sz)
                 saving = (1 - comp_sz / orig_sz) * 100
                 print(f"  [OK] {display_name}{probe_tag} -> {get_size_format(orig_sz)} to {get_size_format(comp_sz)} ({saving:.0f}% smaller)")
             elif "skipped" in status:
@@ -623,6 +625,8 @@ def run_local(args):
                 print(f"  [X] {display_name} -> Failed ({status})")
 
     print(f"\nFinished! Compressed: {ok_count} | Skipped: {skip_count} | Failed: {fail_count}")
+    if ok_count > 0:
+        print(f"[*] Total Storage Saved: {get_size_format(total_saved_bytes)}")
 
 
 def run_adb(args):
@@ -694,6 +698,7 @@ def run_adb(args):
             Path(args.output).mkdir(parents=True, exist_ok=True)
 
         ok_count, skip_count, fail_count = 0, 0, 0
+        total_saved_bytes = 0
         
         # Use a temp directory for staging the individual file cycle
         with tempfile.TemporaryDirectory(prefix="adb_streaming_") as tmpdir:
@@ -731,6 +736,7 @@ def run_adb(args):
 
                     if status == "success" or status == "saved_locally":
                         ok_count += 1
+                        total_saved_bytes += (orig_sz - comp_sz)
                         saving = (1 - comp_sz / orig_sz) * 100 if orig_sz else 0
                         size_info = f"{get_size_format(orig_sz)} -> {get_size_format(comp_sz)} ({saving:.0f}% smaller)"
                         action_msg = "Processed & Pushed" if status == "success" else "Saved Locally"

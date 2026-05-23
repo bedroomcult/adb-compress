@@ -733,8 +733,12 @@ def guided_setup(ns=None):
         ns.source = ask("Device path to scan", default=ns.source or "/sdcard/DCIM/Camera")
     else:
         ns.source = ask("Local folder directory absolute path", default=ns.source or "")
+        # Expand ~ and make absolute
+        if ns.source:
+            ns.source = os.path.abspath(os.path.expanduser(ns.source))
+        
         if not ns.source or not Path(ns.source).is_dir():
-            print("  [!] Valid source directory parameters required to map targets."); sys.exit(1)
+            print(f"  [!] Valid source directory parameters required to map targets. (Input: {ns.source})"); sys.exit(1)
 
     ns.recursive = ask_bool("Traverse sub-directories recursively?", default=ns.recursive)
 

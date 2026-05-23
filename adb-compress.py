@@ -839,7 +839,7 @@ def main():
         if args.adb_keep_local and not args.output: parser.error("Output parameters directory missing designation requirements maps.")
         run_adb(args)
     else:
-        if not args.overwrite and not args.output: parser.error("Provide destination directory paths or switch on explicit dangerous execution settings.")
+        if not args.index_only and not args.overwrite and not args.output: parser.error("Provide destination directory paths or switch on explicit dangerous execution settings.")
         run_local(args)
 
 if __name__ == "__main__":

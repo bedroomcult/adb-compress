@@ -711,7 +711,8 @@ def guided_setup(ns=None):
         ns = argparse.Namespace(
             adb=False, encoder="libx264", overwrite=False, output=None,
             adb_keep_local=False, age=30, min_size=0.0, recursive=False, 
-            max_width=1920, crf=28, max_bitrate=None, anon=False, source=None
+            max_width=1920, crf=28, max_bitrate=None, anon=False, source=None,
+            index_only=False
         )
 
     print("\n========================================")
@@ -722,12 +723,15 @@ def guided_setup(ns=None):
     mode = ask_choice("Where are your targets located?", [("Local Disk Drive Folder", "local"), ("Android ADB USB Mount Path", "adb")], default=default_mode)
     ns.adb = (mode == "adb")
     
-    default_encoder_idx = 1
-    for idx, (val, _) in enumerate(_ENCODER_CANDIDATES, 1):
-        if val == ns.encoder:
-            default_encoder_idx = idx
-            break
-    ns.encoder = ask_choice("Select Codec Video Processing Pipeline Target Engine:", _ENCODER_CANDIDATES, default=default_encoder_idx)
+    ns.index_only = ask_bool("Perform Probing/Indexing ONLY? (No compression, just update SQLite)", default=ns.index_only)
+
+    if not ns.index_only:
+        default_encoder_idx = 1
+        for idx, (val, _) in enumerate(_ENCODER_CANDIDATES, 1):
+            if val == ns.encoder:
+                default_encoder_idx = idx
+                break
+        ns.encoder = ask_choice("Select Codec Video Processing Pipeline Target Engine:", _ENCODER_CANDIDATES, default=default_encoder_idx)
 
     if ns.adb:
         ns.source = ask("Device path to scan", default=ns.source or "/sdcard/DCIM/Camera")
@@ -742,23 +746,24 @@ def guided_setup(ns=None):
 
     ns.recursive = ask_bool("Traverse sub-directories recursively?", default=ns.recursive)
 
-    if ns.adb:
-        default_dest = 2 if ns.adb_keep_local else 1
-        dest = ask_choice("What should happen to successful processed configurations?", [("Push back to rewrite storage directly (Destructive)", "push"), ("Stage into local environment workspace", "keep")], default=default_dest)
-        if dest == "keep":
-            ns.adb_keep_local = True
-            ns.output = ask("Local path directory context location", default=ns.output or "./compressed")
+    if not ns.index_only:
+        if ns.adb:
+            default_dest = 2 if ns.adb_keep_local else 1
+            dest = ask_choice("What should happen to successful processed configurations?", [("Push back to rewrite storage directly (Destructive)", "push"), ("Stage into local environment workspace", "keep")], default=default_dest)
+            if dest == "keep":
+                ns.adb_keep_local = True
+                ns.output = ask("Local path directory context location", default=ns.output or "./compressed")
+            else:
+                ns.adb_keep_local = False
         else:
-            ns.adb_keep_local = False
-    else:
-        default_dest = 2 if ns.overwrite else 1
-        dest = ask_choice("File mapping save architecture paradigm?", [("Write safe context inside isolated export target directory", "folder"), ("Overwrite local items in place (Destructive)", "overwrite")], default=default_dest)
-        if dest == "folder":
-            ns.overwrite = False
-            ns.output = ask("Export destination path", default=ns.output or "./compressed")
-        else:
-            if not ask_bool("Destructive configurations confirmed? Backups recommended.", default=False): sys.exit(0)
-            ns.overwrite = True
+            default_dest = 2 if ns.overwrite else 1
+            dest = ask_choice("File mapping save architecture paradigm?", [("Write safe context inside isolated export target directory", "folder"), ("Overwrite local items in place (Destructive)", "overwrite")], default=default_dest)
+            if dest == "folder":
+                ns.overwrite = False
+                ns.output = ask("Export destination path", default=ns.output or "./compressed")
+            else:
+                if not ask_bool("Destructive configurations confirmed? Backups recommended.", default=False): sys.exit(0)
+                ns.overwrite = True
 
     raw_age = ask("Minimum lifetime duration age filters (Days)", default=ns.age)
     ns.age = int(raw_age) if str(raw_age).isdigit() else 30
@@ -767,19 +772,20 @@ def guided_setup(ns=None):
     try: ns.min_size = float(raw_size)
     except: ns.min_size = 0.0
 
-    default_res_idx = 3
-    for idx, (_, w, _, _) in enumerate(_RESOLUTION_TEMPLATES, 1):
-        if w == ns.max_width:
-            default_res_idx = idx
-            break
-    
-    selected_res = ask_choice("Select maximum video width resolution:", _RESOLUTION_TEMPLATES, default=default_res_idx)
-    ns.max_width = selected_res[0]
-    ns.max_bitrate = selected_res[1]
-    template_crf = selected_res[2]
+    if not ns.index_only:
+        default_res_idx = 3
+        for idx, (_, w, _, _) in enumerate(_RESOLUTION_TEMPLATES, 1):
+            if w == ns.max_width:
+                default_res_idx = idx
+                break
+        
+        selected_res = ask_choice("Select maximum video width resolution:", _RESOLUTION_TEMPLATES, default=default_res_idx)
+        ns.max_width = selected_res[0]
+        ns.max_bitrate = selected_res[1]
+        template_crf = selected_res[2]
 
-    raw_crf = ask("Video processing CRF resolution density boundaries (0-51)", default=template_crf)
-    ns.crf = int(raw_crf) if str(raw_crf).isdigit() else template_crf
+        raw_crf = ask("Video processing CRF resolution density boundaries (0-51)", default=template_crf)
+        ns.crf = int(raw_crf) if str(raw_crf).isdigit() else template_crf
 
     ns.anon = ask_bool("Enable Anonymity Mode? (Hide filenames in logs)", default=ns.anon)
 

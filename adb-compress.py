@@ -49,6 +49,9 @@ class MediaDB:
             cursor = conn.execute("SELECT width, bitrate_mbps, probe_info, size_bytes, mtime FROM media_index WHERE rel_path = ?", (rel_path,))
             return cursor.fetchone()
 
+    def close(self):
+        pass # sqlite3.connect uses context manager; auto-close
+
 # =============================================
 # Dependency checker
 # =============================================
@@ -815,13 +818,15 @@ def run_adb(args):
                         fail_count += 1
                         print(f"  [X] Failed: {display_name} | Reason: {status}")
 
-            # Push index back to device if modified
+            # Push updated index back to device if modified
             if db:
+                del db
                 try:
                     adb_push(ldb, remote_db)
                     print(f"[*] Media index updated on device: {remote_db}")
                 except:
                     print("[!] Failed to push media index back to device.")
+
 
     print(f"\nDevice Processing Done! Results -> Success: {ok_count} | Skipped: {skip_count} | Failed: {fail_count}")
     if ok_count > 0:

@@ -206,11 +206,11 @@ def get_file_age_days(mtime):
 # =============================================
 
 _ENCODER_CANDIDATES = [
-    ("libx264",      "CPU (libx264) - Universal"),
-    ("h264_nvenc",   "NVIDIA NVENC (Hardware Accelerated)"),
-    ("h264_amf",     "AMD AMF (Hardware Accelerated)"),
-    ("h264_qsv",     "Intel QSV (Hardware Accelerated)"),
-    ("h264_videotoolbox", "Apple VideoToolbox (Hardware Accelerated)"),
+    ("CPU (libx264) - Universal", "libx264"),
+    ("NVIDIA NVENC (Hardware Accelerated)", "h264_nvenc"),
+    ("AMD AMF (Hardware Accelerated)", "h264_amf"),
+    ("Intel QSV (Hardware Accelerated)", "h264_qsv"),
+    ("Apple VideoToolbox (Hardware Accelerated)", "h264_videotoolbox"),
 ]
 
 _RESOLUTION_TEMPLATES = [
@@ -407,10 +407,13 @@ def compress_video(input_path, output_path, max_width, crf, max_bitrate_mbps, en
     if bitrate: probe_parts.append(f"{bitrate}M")
     probe_info = "@".join(probe_parts)
     
-    # Pre-check limits
-    within_width = not max_width or not input_width or input_width <= max_width
-    within_bitrate = not max_bitrate_mbps or not bitrate or bitrate <= max_bitrate_mbps
-    if within_width and within_bitrate and (max_width or max_bitrate_mbps):
+    # Pre-check limits - ONLY skip if we successfully probed AND it's within limits
+    # If probing fails (None), we proceed to be safe.
+    probed_ok = input_width is not None and bitrate is not None
+    within_width = input_width is not None and input_width <= max_width
+    within_bitrate = bitrate is not None and bitrate <= max_bitrate_mbps
+    
+    if probed_ok and within_width and within_bitrate:
         return "skipped_limits", probe_info
 
     hw_quality_flags = {
@@ -482,6 +485,43 @@ def process_file_worker(file_info):
         return fp.name, res, size, 0, probe_info
 
 # =============================================
+# Cancellation Infrastructure
+# =============================================
+
+_cancel = threading.Event()
+
+def _cancel_listener():
+    """
+    Background thread: wait for the user to press Q (then Enter) or Ctrl+C.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+        while not _cancel.is_set():
+            if msvcrt.kbhit():
+                try:
+                    ch = msvcrt.getwch()
+                    if ch.lower() == 'q':
+                        _cancel.set()
+                        print("\n[!] Abort requested. Finishing active tasks and cleaning up...")
+                        break
+                except: break
+            time.sleep(0.1)
+    else:
+        # Standard POSIX / Termux
+        while not _cancel.is_set():
+            try:
+                line = sys.stdin.readline()
+                if line.strip().lower() == 'q':
+                    _cancel.set()
+                    print("\n[!] Abort requested. Finishing active tasks and cleaning up...")
+                    break
+            except: break
+
+def _start_cancel_listener():
+    t = threading.Thread(target=_cancel_listener, daemon=True)
+    t.start()
+
+# =============================================
 # Mode Runners
 # =============================================
 
@@ -499,11 +539,25 @@ def run_local(args):
     for fp in iterator:
         if fp.is_file() and fp.suffix.lower() in EXTENSIONS_IMG | EXTENSIONS_VID:
             if fp.name == "media_index.sqlite": continue
+            
             stat = os.stat(fp)
-            if get_file_age_days(stat.st_mtime) >= args.age and stat.st_size >= min_size_bytes:
-                rel_path = str(fp.relative_to(source_path))
-                tasks.append((str(fp), fp.suffix.lower(), stat.st_size, args.max_width, args.crf, args.max_bitrate, args.encoder, args.output, args.overwrite, rel_path))
-                total_size += stat.st_size
+            mtime = stat.st_mtime
+            size = stat.st_size
+            rel_path = str(fp.relative_to(source_path))
+
+            # Apply filters only if NOT in Indexing-Only mode
+            if not args.index_only:
+                if get_file_age_days(mtime) < args.age or size < min_size_bytes:
+                    continue
+            
+            # Check if we have cached probe data
+            probe_cached = ""
+            cached = db.get_entry(rel_path)
+            if cached:
+                probe_cached = cached[2]
+            
+            tasks.append((str(fp), fp.suffix.lower(), size, args.max_width, args.crf, args.max_bitrate, args.encoder, args.output, args.overwrite, rel_path, mtime, probe_cached))
+            total_size += size
 
     if not tasks:
         print("No files matched your criteria.")
@@ -512,19 +566,26 @@ def run_local(args):
     if args.index_only:
         print(f"[*] Indexing {len(tasks)} files into {db_path.name}...")
         for t in tasks:
-            fp_str, ext, size, mw, crf, mb, enc, out, ovr, rel = t
+            if _cancel.is_set(): break
+            fp_str, ext, size, mw, crf, mb, enc, out, ovr, rel, mtime, cached = t
+            
+            # If already indexed, skip unless we want to force re-probe (keeping it simple: re-probe if empty)
+            if cached:
+                print(f"  [SKP] {rel[:40]} (Already Indexed)")
+                continue
+
             if ext in EXTENSIONS_IMG:
                 from PIL import Image
                 try:
                     with Image.open(fp_str) as img:
                         w, h = img.size
-                        db.update_entry(rel, size, os.path.getmtime(fp_str), w, 0, f"{w}x{h}")
+                        db.update_entry(rel, size, mtime, w, 0, f"{w}x{h}")
                         print(f"  [IDX] {rel[:40]} -> {w}x{h}")
                 except: pass
             else:
                 dur, w, br = _probe_video(fp_str)
                 probe = f"{w}p@{br}M" if w and br else (f"{w}p" if w else "")
-                db.update_entry(rel, size, os.path.getmtime(fp_str), w or 0, br or 0.0, probe)
+                db.update_entry(rel, size, mtime, w or 0, br or 0.0, probe)
                 print(f"  [IDX] {rel[:40]} -> {probe}")
         print("[+] Indexing complete.")
         return
@@ -607,8 +668,21 @@ def run_adb(args):
             return
 
         if args.index_only:
-            print("[!] Index-only mode for ADB requires full pull to probe. This script currently optimizes indexing during the streaming pipeline.")
-            print("    Please run a standard compression session (even with extreme limits) to populate the index.")
+            print(f"[*] Indexing {len(files_to_process)} files from device into {local_db_name}...")
+            for remote_path, ext, size, rel_path, cached_probe, mtime in files_to_process:
+                if _cancel.is_set(): break
+                # Update DB with basic stats (mtime, size)
+                # We don't have probe info yet because we didn't pull, 
+                # but we've fulfilled the user's requirement for age/size fetching.
+                db.update_entry(rel_path, size, mtime, 0, 0.0, cached_probe)
+                print(f"  [IDX] {rel_path[:40]} (Stats Only)")
+            
+            # Push updated index back to device
+            try:
+                adb_push(ldb, remote_db)
+                print(f"[+] Indexing complete. Media index updated on device.")
+            except:
+                print("[!] Failed to push updated media index back to device.")
             return
 
         print(f"[*] Selected Encoder: {args.encoder}")
@@ -655,12 +729,12 @@ def run_adb(args):
                     display_name = f"File #{idx+1}" if args.anon else fname[:30]
                     probe_tag = f" [{probe_info}]" if probe_info else ""
 
-                    if status == "success":
+                    if status == "success" or status == "saved_locally":
                         ok_count += 1
-                        print(f"  [OK] Processed & Pushed: {display_name}{probe_tag}")
-                    elif status == "saved_locally":
-                        ok_count += 1
-                        print(f"  [+] Saved Locally: {display_name}{probe_tag}")
+                        saving = (1 - comp_sz / orig_sz) * 100 if orig_sz else 0
+                        size_info = f"{get_size_format(orig_sz)} -> {get_size_format(comp_sz)} ({saving:.0f}% smaller)"
+                        action_msg = "Processed & Pushed" if status == "success" else "Saved Locally"
+                        print(f"  [OK] {action_msg}: {display_name}{probe_tag} | {size_info}")
                     elif "skipped" in status:
                         skip_count += 1
                         reason = "would grow file" if "larger" in status else "within resolution/bitrate rules"
@@ -731,14 +805,6 @@ def guided_setup(ns=None):
     
     ns.index_only = ask_bool("Perform Probing/Indexing ONLY? (No compression, just update SQLite)", default=ns.index_only)
 
-    if not ns.index_only:
-        default_encoder_idx = 1
-        for idx, (val, _) in enumerate(_ENCODER_CANDIDATES, 1):
-            if val == ns.encoder:
-                default_encoder_idx = idx
-                break
-        ns.encoder = ask_choice("Select Codec Video Processing Pipeline Target Engine:", _ENCODER_CANDIDATES, default=default_encoder_idx)
-
     if ns.adb:
         ns.source = ask("Device path to scan", default=ns.source or "/sdcard/DCIM/Camera")
     else:
@@ -752,24 +818,35 @@ def guided_setup(ns=None):
 
     ns.recursive = ask_bool("Traverse sub-directories recursively?", default=ns.recursive)
 
-    if not ns.index_only:
-        if ns.adb:
-            default_dest = 2 if ns.adb_keep_local else 1
-            dest = ask_choice("What should happen to successful processed configurations?", [("Push back to rewrite storage directly (Destructive)", "push"), ("Stage into local environment workspace", "keep")], default=default_dest)
-            if dest == "keep":
-                ns.adb_keep_local = True
-                ns.output = ask("Local path directory context location", default=ns.output or "./compressed")
-            else:
-                ns.adb_keep_local = False
+    if ns.index_only:
+        print("\nStarting execution routines matrix matching configurations setup requirements...")
+        if not ask_bool("Confirm deployment setup pipeline initialization routines?", default=True): sys.exit(0)
+        return ns
+
+    default_encoder_idx = 1
+    for idx, (_, val) in enumerate(_ENCODER_CANDIDATES, 1):
+        if val == ns.encoder:
+            default_encoder_idx = idx
+            break
+    ns.encoder = ask_choice("Select Codec Video Processing Pipeline Target Engine:", _ENCODER_CANDIDATES, default=default_encoder_idx)
+
+    if ns.adb:
+        default_dest = 2 if ns.adb_keep_local else 1
+        dest = ask_choice("What should happen to successful processed configurations?", [("Push back to rewrite storage directly (Destructive)", "push"), ("Stage into local environment workspace", "keep")], default=default_dest)
+        if dest == "keep":
+            ns.adb_keep_local = True
+            ns.output = ask("Local path directory context location", default=ns.output or "./compressed")
         else:
-            default_dest = 2 if ns.overwrite else 1
-            dest = ask_choice("File mapping save architecture paradigm?", [("Write safe context inside isolated export target directory", "folder"), ("Overwrite local items in place (Destructive)", "overwrite")], default=default_dest)
-            if dest == "folder":
-                ns.overwrite = False
-                ns.output = ask("Export destination path", default=ns.output or "./compressed")
-            else:
-                if not ask_bool("Destructive configurations confirmed? Backups recommended.", default=False): sys.exit(0)
-                ns.overwrite = True
+            ns.adb_keep_local = False
+    else:
+        default_dest = 2 if ns.overwrite else 1
+        dest = ask_choice("File mapping save architecture paradigm?", [("Write safe context inside isolated export target directory", "folder"), ("Overwrite local items in place (Destructive)", "overwrite")], default=default_dest)
+        if dest == "folder":
+            ns.overwrite = False
+            ns.output = ask("Export destination path", default=ns.output or "./compressed")
+        else:
+            if not ask_bool("Destructive configurations confirmed? Backups recommended.", default=False): sys.exit(0)
+            ns.overwrite = True
 
     raw_age = ask("Minimum lifetime duration age filters (Days)", default=ns.age)
     ns.age = int(raw_age) if str(raw_age).isdigit() else 30

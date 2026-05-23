@@ -348,17 +348,23 @@ EXTENSIONS_VID = {'.mp4', '.mkv', '.mov', '.avi'}
 
 def _probe_video(input_path):
     try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration,bit_rate:stream=width", "-of", "csv=p=0", str(input_path)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace"
-        )
+        # Use a more explicit format to ensure predictable parsing
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width:format=bit_rate,duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace")
         lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
-        if not lines: return None, None, None
-        parts = [p.strip() for p in lines[0].split(",")]
-        duration = float(parts[0]) if parts[0] else None
-        bitrate_bps = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        
+        # Output order with default/noprint: width (stream), bitrate (format), duration (format)
+        if len(lines) < 2: return None, None, None
+        
+        width = int(lines[0]) if lines[0].isdigit() else None
+        bitrate_bps = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else None
         bitrate_mbps = round(bitrate_bps / 1_000_000, 1) if bitrate_bps else None
-        width = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        duration = float(lines[2]) if len(lines) > 2 else None
+        
         return duration, width, bitrate_mbps
     except Exception:
         return None, None, None

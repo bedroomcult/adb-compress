@@ -485,6 +485,72 @@ def process_file_worker(file_info):
         return fp.name, res, size, 0, probe_info
 
 # =============================================
+# Progress Tracking
+# =============================================
+
+def _parse_time(time_str):
+    try:
+        parts = time_str.strip().split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except: pass
+    return None
+
+class ProgressTracker:
+    def __init__(self):
+        self.active_tasks = {} # worker_id -> {label, progress, status}
+        self.lock = threading.Lock()
+        self.last_line_len = 0
+
+    def update(self, worker_id, label=None, progress=None, status=None):
+        with self.lock:
+            if worker_id not in self.active_tasks:
+                self.active_tasks[worker_id] = {"label": "", "progress": 0, "status": "Starting"}
+            if label is not None: self.active_tasks[worker_id]["label"] = label
+            if progress is not None: self.active_tasks[worker_id]["progress"] = progress
+            if status is not None: self.active_tasks[worker_id]["status"] = status
+            self._render()
+
+    def remove(self, worker_id):
+        with self.lock:
+            if worker_id in self.active_tasks:
+                del self.active_tasks[worker_id]
+                self._render()
+
+    def _render(self):
+        if not self.active_tasks:
+            # Clear line if no tasks
+            print("\r" + " " * self.last_line_len + "\r", end="", flush=True)
+            self.last_line_len = 0
+            return
+
+        parts = []
+        # Sort by worker_id to keep order consistent
+        for wid in sorted(self.active_tasks.keys()):
+            t = self.active_tasks[wid]
+            prog = f"{t['progress']}%" if isinstance(t['progress'], int) else t['progress']
+            parts.append(f"[{t['label']}: {prog}]")
+        
+        line = " | ".join(parts)
+        # Handle terminal width
+        tw = shutil.get_terminal_size((80, 20)).columns
+        if len(line) > tw - 1:
+            line = line[:tw-4] + "..."
+            
+        print("\r" + " " * self.last_line_len + "\r" + line, end="", flush=True)
+        self.last_line_len = len(line)
+
+    def log(self, message):
+        """Print a message above the current progress line."""
+        with self.lock:
+            # Clear current progress line
+            print("\r" + " " * self.last_line_len + "\r", end="", flush=True)
+            print(message)
+            self._render()
+
+_progress = ProgressTracker()
+
+# =============================================
 # Cancellation Infrastructure
 # =============================================
 
@@ -758,6 +824,8 @@ def run_adb(args):
                     print("[!] Failed to push media index back to device.")
 
     print(f"\nDevice Processing Done! Results -> Success: {ok_count} | Skipped: {skip_count} | Failed: {fail_count}")
+    if ok_count > 0:
+        print(f"[*] Total Storage Saved: {get_size_format(total_saved_bytes)}")
 
 # =============================================
 # Wizard Integration

@@ -46,7 +46,7 @@ class MediaDB:
 
     def get_entry(self, rel_path):
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("SELECT width, bitrate_mbps, probe_info FROM media_index WHERE rel_path = ?", (rel_path,))
+            cursor = conn.execute("SELECT width, bitrate_mbps, probe_info, size_bytes, mtime FROM media_index WHERE rel_path = ?", (rel_path,))
             return cursor.fetchone()
 
 # =============================================

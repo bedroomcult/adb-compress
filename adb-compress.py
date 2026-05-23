@@ -633,7 +633,7 @@ def run_adb(args):
     entries = adb_list_files(args.source, args.recursive)
     
     # Path to remote database
-    remote_db = f"{args.source.rstrip('/')}/media_index.sqlite"
+    remote_db = os.path.join(args.source, "media_index.sqlite").replace("\\", "/")
     local_db_name = "adb_media_index.sqlite"
     db = None
     
